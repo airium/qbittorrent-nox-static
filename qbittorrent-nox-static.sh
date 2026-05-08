@@ -29,6 +29,7 @@ script_version="2.2.5"
 #################################################################################################################################################
 unset qbt_skip_delete qbt_git_proxy qbt_curl_proxy qbt_install_dir qbt_working_dir qbt_modules_test qbt_python_version
 unset qbt_cflags qbt_cxxflags qbt_cppflags qbt_ldflags qbt_cflags_consumed qbt_cxxflags_consumed qbt_cppflags_consumed qbt_ldflags_consumed
+unset qbt_libtorrent_local_src qbt_qbittorrent_local_src qbt_cpu_baseline qbt_cpu_tune qbt_cpu_flag_notice
 #################################################################################################################################################
 # Declare our associative arrays
 #################################################################################################################################################
@@ -301,11 +302,19 @@ _set_default_values() {
 	qbt_openssl_tag="${qbt_openssl_tag:-}"
 	qbt_openssl_lts="${qbt_openssl_lts:-3.5}"
 
+	# Use local source directories for libtorrent/qBittorrent instead of downloading from upstream.
+	qbt_libtorrent_local_src="${qbt_libtorrent_local_src%/}"
+	qbt_qbittorrent_local_src="${qbt_qbittorrent_local_src%/}"
+
 	# We are only using python3 but it's easier to just change this if we need to for some reason.
 	qbt_python_version="3"
 
 	# provide gcc flags for the build - this is not used by default but can be set to provide custom flags for the build.
 	qbt_optimise="${qbt_optimise:-no}"
+
+	# Optional CPU target flags for portable builds.
+	qbt_cpu_baseline="${qbt_cpu_baseline:-}"
+	qbt_cpu_tune="${qbt_cpu_tune:-}"
 
 	# The baseline cxx standard is 17. This is dynamically resolved by _set_cxx_standard based on app versions
 	qbt_standard="${qbt_standard:-17}"
@@ -697,8 +706,12 @@ _print_env() {
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_optimise_strip=\"${color_green_light}${qbt_optimise_strip}${color_yellow_light}\"${color_end}"
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_build_debug=\"${color_green_light}${qbt_build_debug}${color_yellow_light}\"${color_end}"
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_standard=\"${color_green_light}${qbt_standard}${color_yellow_light}\"${color_end}"
+	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_cpu_baseline=\"${color_green_light}${qbt_cpu_baseline}${color_yellow_light}\"${color_end}"
+	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_cpu_tune=\"${color_green_light}${qbt_cpu_tune}${color_yellow_light}\"${color_end}"
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_static_ish=\"${color_green_light}${qbt_static_ish}${color_yellow_light}\"${color_end}"
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_optimise=\"${color_green_light}${qbt_optimise}${color_yellow_light}\"${color_end}"
+	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_libtorrent_local_src=\"${color_green_light}${qbt_libtorrent_local_src}${color_yellow_light}\"${color_end}"
+	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_qbittorrent_local_src=\"${color_green_light}${qbt_qbittorrent_local_src}${color_yellow_light}\"${color_end}"
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_with_qemu=\"${color_green_light}${qbt_with_qemu}${color_yellow_light}\"${color_end}"
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_host_deps=\"${color_green_light}${qbt_host_deps}${color_yellow_light}\"${color_end}"
 	[[ $qbt_advanced_view == "yes" ]] && printf '%b\n' " ${color_yellow_light}  qbt_host_deps_repo=\"${color_green_light}${qbt_host_deps_repo}${color_yellow_light}\"${color_end}"
@@ -770,6 +783,114 @@ _semantic_version() {
 	# Use 10# prefix for values to prevent octal interpretation of zero-padded numbers like 08, 09
 	# Prepend 10 to the final string to prevent bash `[[ -lt ]]` evaluation from parsing it as octal if major is 0
 	printf "10%d%03d%03d%03d%03d" "${major}" "${minor}" "${patch}" "${build}" "${prerelease}"
+}
+#######################################################################################################################################################
+# Local source helpers
+#######################################################################################################################################################
+_resolve_existing_dir() {
+	local source_path="${1}"
+	local resolved_path
+
+	[[ -z ${source_path} ]] && return 1
+	if [[ ${source_path} != /* ]]; then
+		source_path="${qbt_working_dir}/${source_path}"
+	fi
+
+	resolved_path="$(readlink -f "${source_path}" 2> /dev/null)" || return 1
+	[[ -d ${resolved_path} ]] || return 1
+	printf '%s' "${resolved_path}"
+}
+
+_detect_local_libtorrent_version() {
+	local local_src="${1}"
+	local version_hpp="${local_src}/include/libtorrent/version.hpp"
+	local version=""
+
+	if [[ -f ${version_hpp} ]]; then
+		version="$(sed -rn 's|.*LIBTORRENT_VERSION "([^"]+)".*|\1|p; s|.*version_str = "([^"]+)".*|\1|p' "${version_hpp}" | head -n1)"
+	fi
+
+	printf '%s' "${version}"
+}
+
+_detect_local_qbittorrent_version() {
+	local local_src="${1}"
+	local version_file=""
+	local major minor bugfix
+
+	for candidate in "${local_src}/src/base/version.h.in" "${local_src}/src/base/version.h"; do
+		if [[ -f ${candidate} ]]; then
+			version_file="${candidate}"
+			break
+		fi
+	done
+
+	[[ -z ${version_file} ]] && return 1
+
+	major="$(sed -rn 's|^#define[[:space:]]+QBT_VERSION_MAJOR[[:space:]]+([0-9]+).*|\1|p' "${version_file}" | head -n1)"
+	minor="$(sed -rn 's|^#define[[:space:]]+QBT_VERSION_MINOR[[:space:]]+([0-9]+).*|\1|p' "${version_file}" | head -n1)"
+	bugfix="$(sed -rn 's|^#define[[:space:]]+QBT_VERSION_BUGFIX[[:space:]]+([0-9]+).*|\1|p' "${version_file}" | head -n1)"
+
+	if [[ -n ${major} && -n ${minor} && -n ${bugfix} ]]; then
+		printf '%s' "${major}.${minor}.${bugfix}"
+		return 0
+	fi
+
+	return 1
+}
+
+_configure_local_source_overrides() {
+	local local_version
+
+	if [[ -n ${qbt_libtorrent_local_src} ]]; then
+		qbt_libtorrent_local_src="$(_resolve_existing_dir "${qbt_libtorrent_local_src}")" || {
+			printf '\n%b\n\n' " ${unicode_red_circle} Invalid libtorrent local source path: ${color_red_light}${qbt_libtorrent_local_src}${color_end}"
+			exit 1
+		}
+
+		if [[ ! -f ${qbt_libtorrent_local_src}/include/libtorrent/version.hpp ]]; then
+			printf '\n%b\n\n' " ${unicode_red_circle} Local libtorrent source is missing ${color_cyan_light}include/libtorrent/version.hpp${color_end}"
+			exit 1
+		fi
+
+		local_version="$(_detect_local_libtorrent_version "${qbt_libtorrent_local_src}")"
+		app_version[libtorrent]="${local_version:-0.0.0}"
+		github_tag[libtorrent]="local-${app_version[libtorrent]}"
+		github_url[libtorrent]="${qbt_libtorrent_local_src}"
+		source_archive_url[libtorrent]="${qbt_libtorrent_local_src}"
+		qbt_workflow_override[libtorrent]="yes"
+		source_default[libtorrent]="local"
+
+		if [[ -n ${local_version} ]]; then
+			local -a lt_version_array
+			read -ra lt_version_array <<< "${local_version//\./ }"
+			if [[ -n ${lt_version_array[0]} && -n ${lt_version_array[1]} ]]; then
+				qbt_libtorrent_version="${lt_version_array[0]}.${lt_version_array[1]}"
+			fi
+		fi
+
+		_libtorrent_v2_iconv_check
+	fi
+
+	if [[ -n ${qbt_qbittorrent_local_src} ]]; then
+		qbt_qbittorrent_local_src="$(_resolve_existing_dir "${qbt_qbittorrent_local_src}")" || {
+			printf '\n%b\n\n' " ${unicode_red_circle} Invalid qBittorrent local source path: ${color_red_light}${qbt_qbittorrent_local_src}${color_end}"
+			exit 1
+		}
+
+		if [[ ! -f ${qbt_qbittorrent_local_src}/CMakeLists.txt ]]; then
+			printf '\n%b\n\n' " ${unicode_red_circle} Local qBittorrent source is missing ${color_cyan_light}CMakeLists.txt${color_end}"
+			exit 1
+		fi
+
+		local_version="$(_detect_local_qbittorrent_version "${qbt_qbittorrent_local_src}")"
+		app_version[qbittorrent]="${local_version:-0.0.0}"
+		github_tag[qbittorrent]="local-${app_version[qbittorrent]}"
+		github_url[qbittorrent]="${qbt_qbittorrent_local_src}"
+		source_archive_url[qbittorrent]="${qbt_qbittorrent_local_src}"
+		qbt_workflow_override[qbittorrent]="yes"
+		source_default[qbittorrent]="local"
+	fi
 }
 #######################################################################################################################################################
 # Script Version check
@@ -1420,9 +1541,25 @@ _custom_flags() {
 		qbt_include_headers="-I${include_dir}"
 	fi
 
-	# if qbt_optimise=yes then set -march=native for non cross builds - see --o | --optimise
-	if [[ $qbt_optimise == "yes" ]]; then
+	# Optional explicit CPU tuning takes precedence over -o/--optimise defaults.
+	local qbt_explicit_cpu_flags=""
+	if [[ -n ${qbt_cpu_baseline} ]]; then
+		qbt_explicit_cpu_flags+=" -march=${qbt_cpu_baseline}"
+	fi
+	if [[ -n ${qbt_cpu_tune} ]]; then
+		qbt_explicit_cpu_flags+=" -mtune=${qbt_cpu_tune}"
+	fi
+
+	if [[ -n ${qbt_explicit_cpu_flags} ]]; then
+		qbt_optimise_march="${qbt_explicit_cpu_flags# }"
+		if [[ ${qbt_optimise} == "yes" && -z ${qbt_cpu_flag_notice} ]]; then
+			printf '\n%b\n' " ${unicode_yellow_circle} Explicit CPU flags override ${color_blue_light}--optimise${color_end}: ${color_cyan_light}${qbt_optimise_march}${color_end}"
+			qbt_cpu_flag_notice="yes"
+		fi
+	elif [[ ${qbt_optimise} == "yes" ]]; then
 		qbt_optimise_march="-march=native"
+	else
+		qbt_optimise_march=""
 	fi
 
 	# Static linking specific
@@ -1710,10 +1847,18 @@ _set_module_urls() {
 	github_url[double_conversion]="https://github.com/google/double-conversion.git"
 	github_url[openssl]="https://github.com/openssl/openssl.git"
 	github_url[boost]="https://github.com/boostorg/boost.git"
-	github_url[libtorrent]="https://github.com/arvidn/libtorrent.git"
+	if [[ -n ${qbt_libtorrent_local_src} ]]; then
+		github_url[libtorrent]="${qbt_libtorrent_local_src}"
+	else
+		github_url[libtorrent]="https://github.com/arvidn/libtorrent.git"
+	fi
 	github_url[qtbase]="https://github.com/qt/qtbase.git"
 	github_url[qttools]="https://github.com/qt/qttools.git"
-	github_url[qbittorrent]="https://github.com/qbittorrent/qBittorrent.git"
+	if [[ -n ${qbt_qbittorrent_local_src} ]]; then
+		github_url[qbittorrent]="${qbt_qbittorrent_local_src}"
+	else
+		github_url[qbittorrent]="https://github.com/qbittorrent/qBittorrent.git"
+	fi
 	##########################################################################################################################################################
 	# Configure the github_tag associative array for all the applications this script uses and we call them as ${github_tag[app_name]}
 	# When workflow files are active and no override is set, pin the tag from qbt_workflow_versions instead of querying git.
@@ -1748,11 +1893,15 @@ _set_module_urls() {
 	_wf_use double_conversion && github_tag[double_conversion]="v${qbt_workflow_versions[double_conversion]}" || github_tag[double_conversion]="$(_git_git ls-remote -q -t --refs "${github_url[double_conversion]}" | awk '/v/{sub("refs/tags/", "");sub("(.*)(rc|alpha|beta)(.*)", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
 	_wf_use openssl && github_tag[openssl]="openssl-${qbt_workflow_versions[openssl]}" || github_tag[openssl]="$(_git_git ls-remote -q -t --refs "${github_url[openssl]}" | awk '/openssl/{sub("refs/tags/", "");sub("(.*)(rc|alpha|beta)(.*)", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n1)"
 	_wf_use boost && github_tag[boost]="boost-${qbt_workflow_versions[boost]}" || github_tag[boost]="$(_git_git ls-remote -q -t --refs "${github_url[boost]}" | awk '{sub("refs/tags/", "");sub("(.*)(rc|alpha|beta|-bgl)(.*)", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
-	_wf_use libtorrent && github_tag[libtorrent]="v${qbt_workflow_versions[libtorrent]}" || github_tag[libtorrent]="$(_git_git ls-remote -q -t --refs "${github_url[libtorrent]}" | awk '/'"v${qbt_libtorrent_version}"'/{sub("refs/tags/", "");sub("(.*)(-[^0-9].*)(.*)", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
-	[[ -z ${github_tag[libtorrent]} ]] && github_tag[libtorrent]="$(_git_git ls-remote -q -t --refs "${github_url[libtorrent]}" | awk '/'"v${qbt_libtorrent_version}"'/{sub("refs/tags/", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
+	if [[ -z ${qbt_libtorrent_local_src} ]]; then
+		_wf_use libtorrent && github_tag[libtorrent]="v${qbt_workflow_versions[libtorrent]}" || github_tag[libtorrent]="$(_git_git ls-remote -q -t --refs "${github_url[libtorrent]}" | awk '/'"v${qbt_libtorrent_version}"'/{sub("refs/tags/", "");sub("(.*)(-[^0-9].*)(.*)", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
+		[[ -z ${github_tag[libtorrent]} ]] && github_tag[libtorrent]="$(_git_git ls-remote -q -t --refs "${github_url[libtorrent]}" | awk '/'"v${qbt_libtorrent_version}"'/{sub("refs/tags/", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
+	fi
 	_wf_use qtbase && github_tag[qtbase]="v${qbt_workflow_versions[qtbase]}" || github_tag[qtbase]="$(_git_git ls-remote -q -t --refs "${github_url[qtbase]}" | awk '/'"v${qbt_qt_version}"'/ && !/-alpha|-beta|-rc/{sub("refs/tags/", ""); print $2}' | sort -rV | head -n 1)"
 	_wf_use qttools && github_tag[qttools]="v${qbt_workflow_versions[qttools]}" || github_tag[qttools]="$(_git_git ls-remote -q -t --refs "${github_url[qttools]}" | awk '/'"v${qbt_qt_version}"'/ && !/-alpha|-beta|-rc/{sub("refs/tags/", ""); print $2}' | sort -rV | head -n 1)"
-	_wf_use qbittorrent && github_tag[qbittorrent]="release-${qbt_workflow_versions[qbittorrent]}" || github_tag[qbittorrent]="$(_git_git ls-remote -q -t --refs "${github_url[qbittorrent]}" | awk '{sub("refs/tags/", "");sub("(.*)(-[^0-9].*|rc|alpha|beta)(.*)", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
+	if [[ -z ${qbt_qbittorrent_local_src} ]]; then
+		_wf_use qbittorrent && github_tag[qbittorrent]="release-${qbt_workflow_versions[qbittorrent]}" || github_tag[qbittorrent]="$(_git_git ls-remote -q -t --refs "${github_url[qbittorrent]}" | awk '{sub("refs/tags/", "");sub("(.*)(-[^0-9].*|rc|alpha|beta)(.*)", ""); print $2 }' | awk '!/^$/' | sort -rV | head -n 1)"
+	fi
 
 	##########################################################################################################################################################
 	# Configure the app_version associative array for all the applications this script uses and we call them as ${app_version[app_name]}
@@ -1772,10 +1921,14 @@ _set_module_urls() {
 	app_version[double_conversion]="${github_tag[double_conversion]#v}"
 	app_version[openssl]="${github_tag[openssl]#openssl-}"
 	app_version[boost]="${github_tag[boost]#boost-}"
-	app_version[libtorrent]="${github_tag[libtorrent]#v}"
+	if [[ -z ${qbt_libtorrent_local_src} ]]; then
+		app_version[libtorrent]="${github_tag[libtorrent]#v}"
+	fi
 	app_version[qtbase]="$(printf '%s' "${github_tag[qtbase]#v}" | sed 's/-lts-lgpl//g')"
 	app_version[qttools]="$(printf '%s' "${github_tag[qttools]#v}" | sed 's/-lts-lgpl//g')"
-	app_version[qbittorrent]="${github_tag[qbittorrent]#release-}"
+	if [[ -z ${qbt_qbittorrent_local_src} ]]; then
+		app_version[qbittorrent]="${github_tag[qbittorrent]#release-}"
+	fi
 	##########################################################################################################################################################
 	# Configure the source_archive_url associative array for all the applications this script uses and we call them as ${source_archive_url[app_name]}
 	##########################################################################################################################################################
@@ -1794,7 +1947,11 @@ _set_module_urls() {
 	source_archive_url[double_conversion]="https://github.com/google/double-conversion/archive/refs/tags/${github_tag[double_conversion]}.tar.gz"
 	source_archive_url[openssl]="https://github.com/openssl/openssl/releases/download/${github_tag[openssl]}/${github_tag[openssl]}.tar.gz"
 	_boost_url # function to test and set the boost url and more
-	source_archive_url[libtorrent]="https://github.com/arvidn/libtorrent/releases/download/${github_tag[libtorrent]}/libtorrent-rasterbar-${app_version[libtorrent]}.tar.gz"
+	if [[ -n ${qbt_libtorrent_local_src} ]]; then
+		source_archive_url[libtorrent]="${qbt_libtorrent_local_src}"
+	else
+		source_archive_url[libtorrent]="https://github.com/arvidn/libtorrent/releases/download/${github_tag[libtorrent]}/libtorrent-rasterbar-${app_version[libtorrent]}.tar.gz"
+	fi
 
 	read -ra qt_version_short_array <<< "${app_version[qtbase]//\./ }"
 	qt_version_short="${qt_version_short_array[0]}.${qt_version_short_array[1]}"
@@ -1807,7 +1964,11 @@ _set_module_urls() {
 		source_archive_url[qttools]="https://download.qt.io/archive/qt/${qt_version_short}/${app_version[qttools]}/submodules/qttools-everywhere-opensource-src-${app_version[qttools]}.tar.xz"
 	fi
 
-	source_archive_url[qbittorrent]="https://github.com/qbittorrent/qBittorrent/archive/refs/tags/${github_tag[qbittorrent]}.tar.gz"
+	if [[ -n ${qbt_qbittorrent_local_src} ]]; then
+		source_archive_url[qbittorrent]="${qbt_qbittorrent_local_src}"
+	else
+		source_archive_url[qbittorrent]="https://github.com/qbittorrent/qBittorrent/archive/refs/tags/${github_tag[qbittorrent]}.tar.gz"
+	fi
 	##########################################################################################################################################################
 	# Configure the qbt_workflow_archive_url associative array for all the applications this script uses and we call them as ${qbt_workflow_archive_url[app_name]}
 	##########################################################################################################################################################
@@ -1831,6 +1992,31 @@ _set_module_urls() {
 	qbt_workflow_archive_url[qttools]="https://github.com/userdocs/qbt-workflow-files/releases/latest/download/qt${qbt_qt_version:0:1}tools.tar.xz"
 	qbt_workflow_archive_url[qbittorrent]="https://github.com/userdocs/qbt-workflow-files/releases/latest/download/qbittorrent.tar.xz"
 	##########################################################################################################################################################
+	##########################################################################################################################################################
+	# Configure workflow override options
+	##########################################################################################################################################################
+	if [[ ${os_id} =~ ^(debian|ubuntu)$ ]]; then
+		qbt_workflow_override[glibc]="no"
+	fi
+	qbt_workflow_override[zlib]="no"
+	qbt_workflow_override[iconv]="no"
+	qbt_workflow_override[icu]="no"
+	qbt_workflow_override[double_conversion]="no"
+	qbt_workflow_override[openssl]="no"
+	qbt_workflow_override[boost]="no"
+	if [[ -n ${qbt_libtorrent_local_src} ]]; then
+		qbt_workflow_override[libtorrent]="yes"
+	else
+		qbt_workflow_override[libtorrent]="no"
+	fi
+	qbt_workflow_override[qtbase]="no"
+	qbt_workflow_override[qttools]="no"
+	if [[ -n ${qbt_qbittorrent_local_src} ]]; then
+		qbt_workflow_override[qbittorrent]="yes"
+	else
+		qbt_workflow_override[qbittorrent]="no"
+	fi
+	##########################################################################################################################################################
 	# Configure the default source type we use for the download function
 	##########################################################################################################################################################
 	if [[ ${os_id} =~ ^(debian|ubuntu)$ ]]; then
@@ -1842,10 +2028,18 @@ _set_module_urls() {
 	source_default[double_conversion]="file"
 	source_default[openssl]="file"
 	source_default[boost]="file"
-	source_default[libtorrent]="file"
+	if [[ -n ${qbt_libtorrent_local_src} ]]; then
+		source_default[libtorrent]="local"
+	else
+		source_default[libtorrent]="file"
+	fi
 	source_default[qtbase]="file"
 	source_default[qttools]="file"
-	source_default[qbittorrent]="file"
+	if [[ -n ${qbt_qbittorrent_local_src} ]]; then
+		source_default[qbittorrent]="local"
+	else
+		source_default[qbittorrent]="file"
+	fi
 	##########################################################################################################################################################
 	#
 	##########################################################################################################################################################
@@ -1934,6 +2128,11 @@ _apply_patches() {
 	else
 		patch_dir="${qbt_install_dir}/patches/${app_name}/${app_version[${app_name}]}"
 		patch_file="${patch_dir}/patch"
+
+		if [[ (${app_name} == "libtorrent" && -n ${qbt_libtorrent_local_src}) || (${app_name} == "qbittorrent" && -n ${qbt_qbittorrent_local_src}) ]]; then
+			printf '\n%b\n' " ${unicode_yellow_circle} Skipping patch processing for local ${color_magenta_light}${app_name}${color_end} source"
+			return
+		fi
 
 		# Patches repo branches will be resolved per-repo later to support multiple URLs
 
@@ -2246,9 +2445,31 @@ _download() {
 		[[ ${qbt_workflow_files} == "yes" ]] && source_type="workflow"
 	fi
 
-	[[ -n ${qbt_cache_dir} ]] && _cache_dirs
+	# Guard against stale OpenSSL 4 cache files when the selected default is OpenSSL 3.x.
+	if [[ ${app_name} == "openssl" && -n ${qbt_cache_dir} && ${github_tag[openssl]} =~ ^openssl-3\. ]]; then
+		local openssl_cache_dir="${qbt_cache_dir}"
+		if [[ ${openssl_cache_dir} != /* ]]; then
+			openssl_cache_dir="${qbt_working_dir}/${openssl_cache_dir}"
+		fi
+		local openssl_cache_file="${openssl_cache_dir}/openssl.tar.xz"
+		if [[ -f ${openssl_cache_file} ]]; then
+			local cached_top_dir=""
+			cached_top_dir="$(tar tf "${openssl_cache_file}" 2> /dev/null | head -n1)"
+			if [[ ${cached_top_dir} =~ ^openssl-4 ]]; then
+				printf '\n%b\n\n' " ${unicode_yellow_circle} Removing stale ${color_magenta_light}openssl${color_end} cache (${color_cyan_light}${cached_top_dir%/}${color_end}) to enforce OpenSSL 3.x compatibility"
+				rm -f "${openssl_cache_file}"
+				rm -rf "${openssl_cache_dir}/openssl"
+			fi
+		fi
+	fi
+
+	if [[ -n ${qbt_cache_dir} && ${source_default[${app_name}]} != "local" ]]; then
+		_cache_dirs
+	fi
+
 	[[ ${source_default[${app_name}]} == "file" ]] && _download_file
 	[[ ${source_default[${app_name}]} == "folder" ]] && _download_folder
+	[[ ${source_default[${app_name}]} == "local" ]] && _download_local
 
 	return 0
 }
@@ -2435,6 +2656,75 @@ _download_folder() {
 	_cache_dirs_qbt_env
 
 	printf '%s' "${github_url[${app_name}]}" |& _tee "${qbt_install_dir}/logs/${app_name}_github_url.log" > /dev/null
+
+	if [[ ${qbt_with_qemu} == "no" && ${qbt_restore_host_deps} == "yes" ]]; then
+		app_name="${app_name}_host_deps"
+	fi
+
+	return
+}
+#######################################################################################################################################################
+# This function copies module source from local directories instead of downloading from remote URLs.
+#######################################################################################################################################################
+_download_local() {
+	local local_src=""
+
+	case "${app_name}" in
+		libtorrent)
+			local_src="${qbt_libtorrent_local_src}"
+			;;
+		qbittorrent)
+			local_src="${qbt_qbittorrent_local_src}"
+			;;
+		*)
+			_error_tag "${app_name}" "Local source mode is not supported for this module"
+			;;
+	esac
+
+	if [[ -z ${local_src} || ! -d ${local_src} ]]; then
+		_error_tag "${app_name}" "Invalid local source path: ${local_src}"
+	fi
+
+	if ! command -v rsync &> /dev/null; then
+		_error_tag "${app_name}" "rsync is required when using local source mode"
+	fi
+
+	[[ -d "${qbt_install_dir}/${app_name}" ]] && rm -rf "${qbt_install_dir}/${app_name:?}"
+	[[ -d "${qbt_install_dir}/include/${app_name}" ]] && rm -rf "${qbt_install_dir}/include/${app_name:?}"
+
+	mkdir -p "${qbt_install_dir}/${app_name}"
+	printf '\n%b\n\n' " ${unicode_blue_light_circle} Copying local ${color_magenta_light}${app_name}${color_end} source from ${color_cyan_light}${local_src}${color_end} to ${color_cyan_light}${qbt_install_dir}/${app_name}${color_end}"
+	if ! rsync -a --delete "${local_src}/" "${qbt_install_dir}/${app_name}/"; then
+		_error_tag "${app_name}" "Failed to rsync local source"
+	fi
+
+	if [[ -n ${qbt_cache_dir} ]]; then
+		local local_cache_dir="${qbt_cache_dir}"
+		if [[ ${local_cache_dir} != /* ]]; then
+			local_cache_dir="${qbt_working_dir}/${local_cache_dir}"
+		fi
+		if [[ -d "${local_cache_dir}/${app_name}" ]] || [[ -f "${local_cache_dir}/${app_name}.tar.xz" ]]; then
+			printf '\n%b\n\n' " ${unicode_blue_light_circle} Removing cached ${color_magenta_light}${app_name}${color_end} source to force local-source rebuilds"
+			rm -rf "${local_cache_dir}/${app_name}"
+			rm -f "${local_cache_dir}/${app_name}.tar.xz"
+		fi
+	fi
+
+	if [[ -d "${qbt_install_dir}/${app_name}/.git" ]]; then
+		printf '\n%b\n\n' " ${unicode_blue_light_circle} Updating git submodules for local ${color_magenta_light}${app_name}${color_end} source"
+		if ! _git_git -C "${qbt_install_dir}/${app_name}" submodule sync --recursive; then
+			_error_tag "${app_name}" "Failed to sync local git submodules"
+		fi
+		if ! _git_git -C "${qbt_install_dir}/${app_name}" submodule update --init --recursive --remote; then
+			_error_tag "${app_name}" "Failed to update local git submodules"
+		fi
+	else
+		printf '\n%b\n\n' " ${unicode_yellow_circle} Local ${color_magenta_light}${app_name}${color_end} source has no ${color_cyan_light}.git${color_end} directory; skipping submodule update"
+	fi
+
+	qbt_dl_folder_path="${qbt_install_dir}/${app_name}"
+	mkdir -p "${qbt_dl_folder_path}${sub_dir}"
+	_pushd "${qbt_dl_folder_path}${sub_dir}"
 
 	if [[ ${qbt_with_qemu} == "no" && ${qbt_restore_host_deps} == "yes" ]]; then
 		app_name="${app_name}_host_deps"
@@ -3197,6 +3487,15 @@ while (("${#}")); do
 			fi
 			shift
 			;;
+		-ls | --libtorrent-local-src)
+			if [[ -n ${2} ]]; then
+				qbt_libtorrent_local_src="${2%/}"
+				shift 2
+			else
+				printf '\n%b\n\n' " ${unicode_red_circle} You must provide a local source directory when using ${color_blue_light}-ls${color_end}"
+				exit 1
+			fi
+			;;
 		-ma | --multi-arch)
 			if [[ -n ${2} && ${multi_arch_options[${2}]} == "${2}" ]]; then
 				qbt_cross_name="${2}"
@@ -3228,6 +3527,15 @@ while (("${#}")); do
 		-q | --qmake)
 			qbt_build_tool="qmake"
 			shift
+			;;
+		-qs | --qbittorrent-local-src)
+			if [[ -n ${2} ]]; then
+				qbt_qbittorrent_local_src="${2%/}"
+				shift 2
+			else
+				printf '\n%b\n\n' " ${unicode_red_circle} You must provide a local source directory when using ${color_blue_light}-qs${color_end}"
+				exit 1
+			fi
 			;;
 		-s | --strip)
 			qbt_optimise_strip="yes"
@@ -3271,6 +3579,7 @@ set -- "${params1[@]}"
 # Functions part 1: Use some of our functions
 #######################################################################################################################################################
 _set_default_values "${@}"                                                  # see functions
+_configure_local_source_overrides                                             # local source path setup before URL/tag resolution
 _check_dependencies "${@}" && set -- "${filtered_check_dependency_args[@]}" # see functions
 _test_url
 _set_build_directory    # see functions
@@ -3282,9 +3591,9 @@ _script_version         # see functions
 [[ -n ${qbt_patches_url} ]] && set -- -pr "${qbt_patches_url}" "${@}"
 [[ -n ${qbt_openssl_tag} ]] && set -- -ot "${qbt_openssl_tag}" "${@}"
 [[ -n ${qbt_boost_tag} ]] && set -- -bt "${qbt_boost_tag}" "${@}"
-[[ -n ${qbt_libtorrent_tag} ]] && set -- -lt "${qbt_libtorrent_tag}" "${@}"
+[[ -n ${qbt_libtorrent_tag} && -z ${qbt_libtorrent_local_src} ]] && set -- -lt "${qbt_libtorrent_tag}" "${@}"
 [[ -n ${qbt_qt_tag} ]] && set -- -qtt "${qbt_qt_tag}" "${@}"
-[[ -n ${qbt_qbittorrent_tag} ]] && set -- -qt "${qbt_qbittorrent_tag}" "${@}"
+[[ -n ${qbt_qbittorrent_tag} && -z ${qbt_qbittorrent_local_src} ]] && set -- -qt "${qbt_qbittorrent_tag}" "${@}"
 #######################################################################################################################################################
 # This section controls our flags that we can pass to the script to modify some variables and behavior.
 #######################################################################################################################################################
@@ -3376,11 +3685,33 @@ while (("${#}")); do
 				exit 1
 			fi
 			;;
+		-cb | --cpu-baseline)
+			if [[ -n ${2} ]]; then
+				qbt_cpu_baseline="${2}"
+				shift 2
+			else
+				printf '\n%b\n\n' " ${unicode_red_circle} ${color_yellow_light}You must provide a CPU baseline value:${color_end} ${color_blue_light}${1} x86-64-v2${color_end}"
+				exit 1
+			fi
+			;;
+		-ct | --cpu-tune)
+			if [[ -n ${2} ]]; then
+				qbt_cpu_tune="${2}"
+				shift 2
+			else
+				printf '\n%b\n\n' " ${unicode_red_circle} ${color_yellow_light}You must provide a CPU tune value:${color_end} ${color_blue_light}${1} haswell${color_end}"
+				exit 1
+			fi
+			;;
 		-n | --no-delete)
 			qbt_skip_delete="yes"
 			shift
 			;;
 		-m | --master)
+			if [[ -n ${qbt_libtorrent_local_src} || -n ${qbt_qbittorrent_local_src} ]]; then
+				printf '\n%b\n\n' " ${unicode_red_circle} ${color_yellow_light}Cannot use ${color_blue_light}${1}${color_end}${color_yellow_light} with local source mode.${color_end}"
+				exit 1
+			fi
 			github_tag[libtorrent]="$(_git "${github_url[libtorrent]}" -t "RC_${qbt_libtorrent_version//./_}")"
 			app_version[libtorrent]="${github_tag[libtorrent]}"
 			qbt_workflow_override[libtorrent]="yes"
@@ -3394,6 +3725,10 @@ while (("${#}")); do
 			shift
 			;;
 		-lm | --libtorrent-master)
+			if [[ -n ${qbt_libtorrent_local_src} ]]; then
+				printf '\n%b\n\n' " ${unicode_red_circle} ${color_yellow_light}Cannot use ${color_blue_light}${1}${color_end}${color_yellow_light} when ${color_cyan_light}--libtorrent-local-src${color_end}${color_yellow_light} is set.${color_end}"
+				exit 1
+			fi
 			github_tag[libtorrent]="$(_git "${github_url[libtorrent]}" -t "RC_${qbt_libtorrent_version//./_}")"
 			app_version[libtorrent]="${github_tag[libtorrent]}"
 			source_default[libtorrent]="folder"
@@ -3402,6 +3737,10 @@ while (("${#}")); do
 			shift
 			;;
 		-lt | --libtorrent-tag)
+			if [[ -n ${qbt_libtorrent_local_src} ]]; then
+				printf '\n%b\n\n' " ${unicode_red_circle} ${color_yellow_light}Cannot use ${color_blue_light}${1}${color_end}${color_yellow_light} when ${color_cyan_light}--libtorrent-local-src${color_end}${color_yellow_light} is set.${color_end}"
+				exit 1
+			fi
 			if [[ -n ${2} ]]; then
 				qbt_default_libtorrent_github_tag="${github_tag[libtorrent]}"
 				github_tag[libtorrent]="$(_git "${github_url[libtorrent]}" -t "$2")"
@@ -3472,6 +3811,10 @@ while (("${#}")); do
 			fi
 			;;
 		-qm | --qbittorrent-master)
+			if [[ -n ${qbt_qbittorrent_local_src} ]]; then
+				printf '\n%b\n\n' " ${unicode_red_circle} ${color_yellow_light}Cannot use ${color_blue_light}${1}${color_end}${color_yellow_light} when ${color_cyan_light}--qbittorrent-local-src${color_end}${color_yellow_light} is set.${color_end}"
+				exit 1
+			fi
 			github_tag[qbittorrent]="$(_git "${github_url[qbittorrent]}" -t "master")"
 			app_version[qbittorrent]="${github_tag[qbittorrent]#release-}"
 			source_default[qbittorrent]="folder"
@@ -3481,6 +3824,10 @@ while (("${#}")); do
 			shift
 			;;
 		-qt | --qbittorrent-tag)
+			if [[ -n ${qbt_qbittorrent_local_src} ]]; then
+				printf '\n%b\n\n' " ${unicode_red_circle} ${color_yellow_light}Cannot use ${color_blue_light}${1}${color_end}${color_yellow_light} when ${color_cyan_light}--qbittorrent-local-src${color_end}${color_yellow_light} is set.${color_end}"
+				exit 1
+			fi
 			if [[ -n ${2} ]]; then
 				qbt_default_qbittorrent_github_tag="${github_tag[qbittorrent]}"
 				github_tag[qbittorrent]="$(_git "${github_url[qbittorrent]}" -t "$2")"
@@ -3543,8 +3890,10 @@ while (("${#}")); do
 			printf '\n%b\n\n' " ${text_bold}${text_underlined}Here are a list of available options${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-b${color_end}     ${text_dim}or${color_end} ${color_blue_light}--build-directory${color_end}       ${color_yellow}Help:${color_end} ${color_blue_light}-h-b${color_end}     ${text_dim}or${color_end} ${color_blue_light}--help-build-directory${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-bt${color_end}    ${text_dim}or${color_end} ${color_blue_light}--boost-tag${color_end}             ${color_yellow}Help:${color_end} ${color_blue_light}-h-bt${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-boost-tag${color_end}"
+			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-cb${color_end}    ${text_dim}or${color_end} ${color_blue_light}--cpu-baseline${color_end}          ${color_yellow}Help:${color_end} ${color_blue_light}-h-cb${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-cpu-baseline${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-c${color_end}     ${text_dim}or${color_end} ${color_blue_light}--cmake${color_end}                 ${color_yellow}Help:${color_end} ${color_blue_light}-h-c${color_end}     ${text_dim}or${color_end} ${color_blue_light}--help-cmake${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-cd${color_end}    ${text_dim}or${color_end} ${color_blue_light}--cache-directory${color_end}       ${color_yellow}Help:${color_end} ${color_blue_light}-h-cd${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-cache-directory${color_end}"
+			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-ct${color_end}    ${text_dim}or${color_end} ${color_blue_light}--cpu-tune${color_end}              ${color_yellow}Help:${color_end} ${color_blue_light}-h-ct${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-cpu-tune${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-d${color_end}     ${text_dim}or${color_end} ${color_blue_light}--debug${color_end}                 ${color_yellow}Help:${color_end} ${color_blue_light}-h-d${color_end}     ${text_dim}or${color_end} ${color_blue_light}--help-debug${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-bs-e${color_end}  ${text_dim}or${color_end} ${color_blue_light}--bootstrap-env${color_end}         ${color_yellow}Help:${color_end} ${color_blue_light}-h-bs-e${color_end}  ${text_dim}or${color_end} ${color_blue_light}--help-bootstrap-env${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-bs-ef${color_end} ${text_dim}or${color_end} ${color_blue_light}--bootstrap-env-full${color_end}    ${color_yellow}Help:${color_end} ${color_blue_light}-h-bs-ef${color_end} ${text_dim}or${color_end} ${color_blue_light}--help-bootstrap-env-full${color_end}"
@@ -3555,6 +3904,7 @@ while (("${#}")); do
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-bs-a${color_end}  ${text_dim}or${color_end} ${color_blue_light}--bootstrap-all${color_end}         ${color_yellow}Help:${color_end} ${color_blue_light}-h-bs-a${color_end}  ${text_dim}or${color_end} ${color_blue_light}--help-bootstrap-all${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-i${color_end}     ${text_dim}or${color_end} ${color_blue_light}--icu${color_end}                   ${color_yellow}Help:${color_end} ${color_blue_light}-h-i${color_end}     ${text_dim}or${color_end} ${color_blue_light}--help-icu${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-lm${color_end}    ${text_dim}or${color_end} ${color_blue_light}--libtorrent-master${color_end}     ${color_yellow}Help:${color_end} ${color_blue_light}-h-lm${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-libtorrent-master${color_end}"
+			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-ls${color_end}    ${text_dim}or${color_end} ${color_blue_light}--libtorrent-local-src${color_end}  ${color_yellow}Help:${color_end} ${color_blue_light}-h-ls${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-libtorrent-local-src${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-lt${color_end}    ${text_dim}or${color_end} ${color_blue_light}--libtorrent-tag${color_end}        ${color_yellow}Help:${color_end} ${color_blue_light}-h-lt${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-libtorrent-tag${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-m${color_end}     ${text_dim}or${color_end} ${color_blue_light}--master${color_end}                ${color_yellow}Help:${color_end} ${color_blue_light}-h-m${color_end}     ${text_dim}or${color_end} ${color_blue_light}--help-master${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-ma${color_end}    ${text_dim}or${color_end} ${color_blue_light}--multi-arch${color_end}            ${color_yellow}Help:${color_end} ${color_blue_light}-h-ma${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-multiarch${color_end}"
@@ -3564,6 +3914,7 @@ while (("${#}")); do
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-p${color_end}     ${text_dim}or${color_end} ${color_blue_light}--proxy${color_end}                 ${color_yellow}Help:${color_end} ${color_blue_light}-h-p${color_end}     ${text_dim}or${color_end} ${color_blue_light}--help-proxy${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-pr${color_end}    ${text_dim}or${color_end} ${color_blue_light}--patch-repo${color_end}            ${color_yellow}Help:${color_end} ${color_blue_light}-h-pr${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-patch-repo${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-q${color_end}     ${text_dim}or${color_end} ${color_blue_light}--qmake${color_end}                 ${color_yellow}Help:${color_end} ${color_blue_light}-h-q${color_end}     ${text_dim}or${color_end} ${color_blue_light}--help-qmake${color_end}"
+			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-qs${color_end}    ${text_dim}or${color_end} ${color_blue_light}--qbittorrent-local-src${color_end} ${color_yellow}Help:${color_end} ${color_blue_light}-h-qs${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-qbittorrent-local-src${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-qm${color_end}    ${text_dim}or${color_end} ${color_blue_light}--qbittorrent-master${color_end}    ${color_yellow}Help:${color_end} ${color_blue_light}-h-qm${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-qbittorrent-master${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-qt${color_end}    ${text_dim}or${color_end} ${color_blue_light}--qbittorrent-tag${color_end}       ${color_yellow}Help:${color_end} ${color_blue_light}-h-qt${color_end}    ${text_dim}or${color_end} ${color_blue_light}--help-qbittorrent-tag${color_end}"
 			printf '%b\n' " ${color_green}Use:${color_end} ${color_blue_light}-qtt${color_end}   ${text_dim}or${color_end} ${color_blue_light}--qt-tag${color_end}                ${color_yellow}Help:${color_end} ${color_blue_light}-h-qtt${color_end}   ${text_dim}or${color_end} ${color_blue_light}--help-qt-tag${color_end}"
@@ -3599,6 +3950,8 @@ while (("${#}")); do
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_qt_version=\"\"${color_end} ${text_dim}----------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}5 | 5.15 | 6 | 6.2 | 6.3 and so on${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_qt_tag=\"\"${color_end} ${text_dim}--------------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}Takes a valid git tag or branch${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_qbittorrent_tag=\"\"${color_end} ${text_dim}-----------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}Takes a valid git tag or branch${color_end}"
+			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_libtorrent_local_src=\"\"${color_end} ${text_dim}------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}path - local libtorrent source directory${color_end}"
+			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_qbittorrent_local_src=\"\"${color_end} ${text_dim}-----${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}path - local qBittorrent source directory${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_build_dir=\"\"${color_end} ${text_dim}-----------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}path - a valid path${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_build_tool=\"\"${color_end} ${text_dim}----------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}cmake | qmake${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_cross_name=\"\"${color_end} ${text_dim}----------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}x86 | x86_64 | aarch64 | armv7 | armhf | riscv64 (see docs for more)${color_end}"
@@ -3609,6 +3962,8 @@ while (("${#}")); do
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_optimise_strip=\"\"${color_end} ${text_dim}------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}yes | no${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_build_debug=\"\"${color_end} ${text_dim}---------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}yes | no${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_standard=\"\"${color_end} ${text_dim}------------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}14 | 17 | 20 | 23 - c standard for gcc - OS dependent${color_end}"
+			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_cpu_baseline=\"\"${color_end} ${text_dim}--------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}compiler value for -march (example x86-64-v2)${color_end}"
+			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_cpu_tune=\"\"${color_end} ${text_dim}------------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}compiler value for -mtune (example haswell)${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_static_ish=\"\"${color_end} ${text_dim}----------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}yes | no${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_optimise=\"\"${color_end} ${text_dim}------------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}yes | no${color_end}"
 			printf '%b\n' " ${text_dim}${color_magenta_light}export qbt_host_deps=\"\"${color_end} ${text_dim}-----------------${color_end} ${text_dim}${color_red_light}options${color_end} ${text_dim}yes | no${color_end}"
@@ -3699,6 +4054,14 @@ while (("${#}")); do
 			printf '\n%b\n\n' " ${unicode_blue_light_circle} Usage example: ${color_blue_light}-bt boost-1.82.0.beta1${color_end}"
 			exit
 			;;
+		-h-cb | --help-cpu-baseline)
+			printf '\n%b\n' " ${unicode_cyan_light_circle} ${text_bold}${text_underlined}Here is the help description for this flag:${color_end}"
+			printf '\n%b\n' " Set an explicit compiler baseline using ${color_cyan_light}-march${color_end}"
+			printf '\n%b\n' " ${unicode_blue_light_circle} Usage example: ${color_blue_light}-cb x86-64-v2${color_end}"
+			printf '\n%b\n' " ${unicode_yellow_circle} This defines a single ISA target and does not enable runtime AVX2 dispatch by itself."
+			printf '\n%b\n\n' " ${unicode_yellow_circle} If ${color_blue_light}-o${color_end} is also set, this option takes precedence."
+			exit
+			;;
 		-h-c | --help-cmake)
 			printf '\n%b\n' " ${unicode_cyan_light_circle} ${text_bold}${text_underlined}Here is the help description for this flag:${color_end}"
 			printf '\n%b\n' " This flag can change the build process in a few ways."
@@ -3722,6 +4085,13 @@ while (("${#}")); do
 		-h-d | --help-debug)
 			printf '\n%b\n' " ${unicode_cyan_light_circle} ${text_bold}${text_underlined}Here is the help description for this flag:${color_end}"
 			printf '\n%b\n\n' " Enable debug symbols for libtorrent and qBittorrent when building - required for gdb backtrace"
+			exit
+			;;
+		-h-ct | --help-cpu-tune)
+			printf '\n%b\n' " ${unicode_cyan_light_circle} ${text_bold}${text_underlined}Here is the help description for this flag:${color_end}"
+			printf '\n%b\n' " Set compiler tuning using ${color_cyan_light}-mtune${color_end} while keeping your baseline from ${color_blue_light}-cb${color_end}"
+			printf '\n%b\n' " ${unicode_blue_light_circle} Usage example: ${color_blue_light}-cb x86-64-v2 -ct haswell${color_end}"
+			printf '\n%b\n\n' " ${unicode_yellow_circle} This adjusts code generation heuristics only and does not add runtime AVX2 function multiversioning."
 			exit
 			;;
 		-h-n | --help-no-delete)
@@ -3763,6 +4133,13 @@ while (("${#}")); do
 			printf '\n%b\n' " This master that will be used is: ${color_green}RC_${qbt_libtorrent_version//./_}${color_end}"
 			printf '\n%b\n' " ${text_dim}This flag is provided with no arguments.${color_end}"
 			printf '\n%b\n\n' " ${color_blue_light}-lm${color_end}"
+			exit
+			;;
+		-h-ls | --help-libtorrent-local-src)
+			printf '\n%b\n' " ${unicode_cyan_light_circle} ${text_bold}${text_underlined}Here is the help description for this flag:${color_end}"
+			printf '\n%b\n' " Use a local libtorrent source tree and skip downloading libtorrent source from the network"
+			printf '\n%b\n' " ${unicode_blue_light_circle} Usage example: ${color_blue_light}-ls ~/src/libtorrent-rasterbar${color_end}"
+			printf '\n%b\n\n' " ${unicode_yellow_circle} When this flag is used, libtorrent patch and Jamfile override steps are skipped."
 			exit
 			;;
 		-h-lt | --help-libtorrent-tag)
@@ -3827,6 +4204,13 @@ while (("${#}")); do
 			printf '\n%b\n' " ${unicode_yellow_circle} Use configure scripts to build apps"
 			printf '%b\n' " ${unicode_yellow_circle} Use qmake to build qtbase, qttools and qbittorrent."
 			printf '\n%b\n\n' " ${unicode_yellow_circle} You can use this flag to build older build combinations that don't use cmake"
+			exit
+			;;
+		-h-qs | --help-qbittorrent-local-src)
+			printf '\n%b\n' " ${unicode_cyan_light_circle} ${text_bold}${text_underlined}Here is the help description for this flag:${color_end}"
+			printf '\n%b\n' " Use a local qBittorrent source tree and skip downloading qBittorrent source from the network"
+			printf '\n%b\n' " ${unicode_blue_light_circle} Usage example: ${color_blue_light}-qs ~/src/qBittorrent${color_end}"
+			printf '\n%b\n\n' " ${unicode_yellow_circle} When this flag is used, qBittorrent patch steps are skipped."
 			exit
 			;;
 		-h-qm | --help-qbittorrent-master)
@@ -4270,6 +4654,7 @@ _qtbase() {
 			-D QT_FEATURE_optimize_full=on -D QT_FEATURE_static=on -D QT_FEATURE_shared=off \
 			-D QT_FEATURE_gui=off -D QT_FEATURE_openssl_linked=on -D QT_FEATURE_dbus=off \
 			-D QT_FEATURE_system_zlib=on -D QT_FEATURE_system_pcre2=off -D QT_FEATURE_widgets=off \
+			-D QT_FEATURE_zstd=off -D QT_FEATURE_glib=off -D QT_FEATURE_brotli=off \
 			-D FEATURE_androiddeployqt=OFF -D FEATURE_animation=OFF \
 			-D QT_FEATURE_testlib=off -D QT_BUILD_EXAMPLES=off -D QT_BUILD_TESTS=off \
 			-D QT_BUILD_EXAMPLES_BY_DEFAULT=OFF -D QT_BUILD_TESTS_BY_DEFAULT=OFF \
